@@ -1,0 +1,19 @@
+# Credentials
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data files
+*.csv
+*.xlsx
+*.xls
+*.json
+
+# Temporary files
+*.log
+.DS_Store
