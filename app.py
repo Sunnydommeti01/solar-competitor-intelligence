@@ -1,41 +1,53 @@
-"""Solar Competitor Intelligence — live API integration readiness dashboard."""
+"""Streamlit dashboard for PM Surya Ghar vendor intelligence.
+
+No CSV dependency. Live requests require a verified encrypted request builder.
+"""
 import streamlit as st
 import pandas as pd
-from api_client import APIIntegrationPending
+
+from api_client import VendorAPIClient, VendorAPIError
 from extractor import extract_district, to_excel_bytes
 from config import STATES
 
-st.set_page_config(page_title='Solar Competitor Intelligence', page_icon='☀️', layout='wide')
-st.title('☀️ Solar Competitor Intelligence')
-st.caption('PM Surya Ghar | District-wise vendor comparison | Live API integration pending')
-st.warning('Live API fetching is NOT yet operational: the portal uses an encrypted POST body and x-ts header. This app does not use a static CSV or display invented results.')
-state = st.selectbox('State', STATES)
-district = st.text_input('District (exact portal label)', value='Eluru' if state == 'Andhra Pradesh' else 'Hyderabad')
-if st.button('Fetch live vendor data', type='primary'):
-    try:
-        with st.spinner('Contacting portal…'):
-            df = extract_district(state, district.strip())
-        if df.empty:
-            st.info('API returned no vendors for this district.')
-        else:
-            st.session_state['vendors'] = df
-            st.session_state['selection'] = (state, district.strip())
-    except APIIntegrationPending as exc:
-        st.error(str(exc))
-    except Exception as exc:
-        st.error(f'Live request failed: {exc}')
+st.set_page_config(page_title="Solar Competitor Intelligence", page_icon="☀️", layout="wide")
+st.title("☀️ Solar Competitor Intelligence")
+st.caption("PM Surya Ghar | District-wise vendor installations")
+st.warning("Live extraction is not configured yet: the portal's encrypted request builder must be verified.")
 
-if 'vendors' in st.session_state:
-    df = st.session_state['vendors']
-    saved_state, saved_district = st.session_state['selection']
-    st.subheader(f'Results: {saved_state} / {saved_district}')
-    a,b,c = st.columns(3)
-    a.metric('Vendors', len(df))
-    b.metric('District installations', f"{df['Installations'].sum():,.0f}")
-    c.metric('Missing counts', int(df['Installations'].isna().sum()))
-    search = st.text_input('Search vendor')
-    filtered = df[df['Vendor Name'].fillna('').str.contains(search, case=False, regex=False)] if search else df
-    st.dataframe(filtered.sort_values('Installations', ascending=False, na_position='last'), use_container_width=True, hide_index=True)
-    st.download_button('Download consolidated Excel', to_excel_bytes(df), file_name='solar_competitor_intelligence.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+state = st.selectbox("State", STATES)
+district = st.text_input("District (exact portal label)", value="Eluru" if state == "Andhra Pradesh" else "Hyderabad")
+
+if st.button("Fetch live vendor data", type="primary"):
+    if not district.strip():
+        st.error("Enter a district name.")
+    else:
+        try:
+            client = VendorAPIClient()  # Needs credentials AND a verified request_builder.
+            with st.spinner("Fetching live vendor data..."):
+                df = extract_district(state, district.strip(), client)
+            st.session_state["vendors"] = df
+            st.session_state["selection"] = (state, district.strip())
+        except (VendorAPIError, ValueError, RuntimeError) as exc:
+            st.error(f"Live API extraction unavailable: {exc}")
+        except Exception as exc:
+            st.error(f"Unexpected error: {type(exc).__name__}: {exc}")
+
+if "vendors" in st.session_state:
+    df = st.session_state["vendors"]
+    selected_state, selected_district = st.session_state["selection"]
+    st.subheader(f"Results: {selected_state} / {selected_district}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Vendor records", len(df))
+    c2.metric("District installations", f"{df['Installations'].sum():,.0f}")
+    c3.metric("Missing installation counts", int(df['Installations'].isna().sum()))
+    query = st.text_input("Search vendor")
+    shown = df[df["Vendor Name"].fillna("").str.contains(query, case=False, regex=False)] if query else df
+    st.dataframe(shown.sort_values("Installations", ascending=False, na_position="last"), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Excel",
+        data=to_excel_bytes(df),
+        file_name="solar_competitor_intelligence.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 else:
-    st.info('No live data loaded. Complete and validate the API request generator before using the dashboard for competitor decisions.')
+    st.info("No live data loaded. The API request builder must be completed before fetching data.")
