@@ -1,100 +1,212 @@
-"""District-wise PM Surya Ghar vendor extraction and Excel export.
+"""PM Surya Ghar registered-vendor browser response collector.
 
-Requires api_client.VendorAPIClient configured with a verified encrypted
-request builder. Does not use CSV or pretend live API access is configured.
+Run locally: python solar_bulk_extractor.py
+The site itself constructs encrypted requests. This script never forges them.
+IMPORTANT: UI selectors are configurable and MUST be calibrated against the live portal.
 """
-from __future__ import annotations
-
+import json
+import logging
+import re
+import time
 from datetime import datetime
-from io import BytesIO
-from zoneinfo import ZoneInfo
-from typing import Any, Iterable
+from pathlib import Path
 
 import pandas as pd
-from api_client import VendorAPIClient, VendorAPIError
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-COLUMNS = ["State", "District", "Vendor ID", "Vendor Name", "Installations"]
+URL = 'https://pmsuryaghar.gov.in/#/registered-vendors'
+ENDPOINT_FRAGMENT = 'registeredVendor/getVendorByStateDistrict'
+STATES = ['Andhra Pradesh', 'Telangana']
+OUTPUT = Path('output')
+PROFILE = Path('chrome_vendor_profile')
 
+# IMPORTANT: Set these after inspecting the real page if auto-discovery fails.
+# Supported CSS selectors for native <select> and clickable custom dropdowns.
+STATE_SELECTOR = ''
+DISTRICT_SELECTOR = ''
+RESPONSE_WAIT_SECONDS = 18
 
-def _vendor_list(payload: Any) -> list[dict]:
-    """Accept a plain vendor list or common JSON response wrappers.
-
-    Unknown response structures raise rather than silently report zero vendors.
-    """
-    if isinstance(payload, list):
-        if not all(isinstance(item, dict) for item in payload):
-            raise ValueError("Vendor response list contains non-object entries")
-        return payload
-    if isinstance(payload, dict):
-        for key in ("data", "result", "response", "vendors", "vendorList"):
-            if key in payload:
-                return _vendor_list(payload[key])
-    raise ValueError("Unrecognized API response structure; inspect actual response JSON")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('vendors')
 
 
-def normalize_vendors(payload: Any, state: str, district: str) -> pd.DataFrame:
-    rows = []
-    for vendor in _vendor_list(payload):
-        details = vendor.get("districtwiseInstallationAndCapacity")
-        count = details.get("installationCount") if isinstance(details, dict) else None
-        rows.append({
-            "State": state,
-            "District": district,
-            "Vendor ID": vendor.get("vendorId"),
-            "Vendor Name": vendor.get("vendorName"),
-            "Installations": count,
-        })
-    df = pd.DataFrame(rows, columns=COLUMNS)
-    df["Installations"] = pd.to_numeric(df["Installations"], errors="coerce").astype("Int64")
-    # Keep vendor rows without IDs; do not accidentally collapse all missing IDs.
-    with_id = df[df["Vendor ID"].notna()].drop_duplicates(
-        subset=["State", "District", "Vendor ID"], keep="first"
-    )
-    without_id = df[df["Vendor ID"].isna()]
-    return pd.concat([with_id, without_id], ignore_index=True)
+def unwrap_vendor_records(payload):
+    """Find vendor-shaped dictionaries in JSON without assuming one response envelope."""
+    found = []
+    def visit(obj):
+        if isinstance(obj, dict):
+            if ('vendorId' in obj or 'vendorName' in obj) and ('districtwiseInstallationAndCapacity' in obj or 'statewiseInstallationAndCapacity' in obj):
+                found.append(obj)
+            else:
+                for v in obj.values():
+                    visit(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                visit(v)
+    visit(payload)
+    return found
 
 
-def extract_district(state: str, district: str, client: VendorAPIClient) -> pd.DataFrame:
-    """Fetch one district; raises when encrypted API integration is unavailable."""
-    payload = client.fetch_vendors(state, district)
-    return normalize_vendors(payload, state, district)
+def count_field(record, key):
+    nested = record.get(key)
+    return nested.get('installationCount') if isinstance(nested, dict) else None
 
 
-def extract_all(districts_by_state: dict[str, Iterable[str]], client: VendorAPIClient) -> pd.DataFrame:
-    """Fetch each district independently; fail rather than silently omit districts."""
-    frames = []
-    for state, districts in districts_by_state.items():
-        for district in districts:
+def dropdown(page, label, override=''):
+    """Best-effort locate state/district controls; explicit selector is preferred."""
+    if override:
+        loc = page.locator(override).first
+        if loc.count():
+            return loc
+        raise RuntimeError(f'{label} selector not found: {override}')
+    # Accessible label / role first.
+    for loc in [page.get_by_label(re.compile(label, re.I)).first,
+                page.get_by_role('combobox', name=re.compile(label, re.I)).first,
+                page.locator(f'select[formcontrolname*="{label.lower()}"]').first,
+                page.locator(f'[placeholder*="{label}"]').first]:
+        try:
+            if loc.count() and loc.is_visible(timeout=1500):
+                return loc
+        except Exception:
+            pass
+    raise RuntimeError(f'Cannot identify {label} dropdown automatically. Set {label.upper()}_SELECTOR in the script. See output/controls.txt.')
+
+
+def option_names(page, control):
+    tag = control.evaluate('(el) => el.tagName.toLowerCase()')
+    if tag == 'select':
+        return [x.strip() for x in control.locator('option').all_text_contents() if x.strip() and not re.search('select|choose', x, re.I)]
+    control.click()
+    page.wait_for_timeout(450)
+    # Angular Material, PrimeNG and ARIA option patterns.
+    opts = page.locator('[role="option"]:visible, mat-option:visible, .p-dropdown-item:visible, .ng-option:visible')
+    names = [x.strip() for x in opts.all_text_contents() if x.strip()]
+    page.keyboard.press('Escape')
+    if not names:
+        raise RuntimeError('Custom dropdown options not discovered; configure selectors based on page DOM.')
+    return list(dict.fromkeys(names))
+
+
+def choose(page, control, name):
+    tag = control.evaluate('(el) => el.tagName.toLowerCase()')
+    if tag == 'select':
+        control.select_option(label=name)
+    else:
+        control.click()
+        page.get_by_role('option', name=name, exact=True).first.click(timeout=5000)
+
+
+def capture_controls(page):
+    OUTPUT.mkdir(exist_ok=True)
+    controls = page.locator('select, [role="combobox"], mat-select, .p-dropdown, .ng-select')
+    lines = []
+    for i in range(controls.count()):
+        c = controls.nth(i)
+        try:
+            lines.append(f'[{i}] {c.evaluate("el => el.outerHTML.slice(0, 1200)")}')
+        except Exception:
+            pass
+    (OUTPUT / 'controls.txt').write_text('\n\n'.join(lines), encoding='utf-8')
+    page.screenshot(path=str(OUTPUT / 'portal_screenshot.png'), full_page=True)
+
+
+def main():
+    OUTPUT.mkdir(exist_ok=True)
+    rows, audits = [], []
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE), headless=False, channel='chrome',
+            viewport={'width': 1440, 'height': 900}, accept_downloads=False,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        responses = []
+
+        def on_response(response):
+            if ENDPOINT_FRAGMENT not in response.url or response.request.method != 'POST':
+                return
             try:
-                frames.append(extract_district(state, district, client))
-            except (VendorAPIError, ValueError) as exc:
-                raise RuntimeError(f"Extraction failed for {state} / {district}: {exc}") from exc
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=COLUMNS)
+                payload = response.json()
+                responses.append({'status': response.status, 'payload': payload, 'timestamp': time.time()})
+            except Exception as exc:
+                log.warning('Vendor response was not readable JSON: %s', exc)
+
+        page.on('response', on_response)
+        page.goto(URL, wait_until='domcontentloaded', timeout=60000)
+        print('\nIf prompted, complete any normal login/consent in Chrome.')
+        input('When the Registered Vendors filters are visible, press ENTER here... ')
+        capture_controls(page)
+
+        for state in STATES:
+            try:
+                state_control = dropdown(page, 'state', STATE_SELECTOR)
+                choose(page, state_control, state)
+                page.wait_for_timeout(900)
+                district_control = dropdown(page, 'district', DISTRICT_SELECTOR)
+                districts = option_names(page, district_control)
+                log.info('%s: discovered %d district options', state, len(districts))
+            except Exception as exc:
+                audits.append({'State': state, 'District': '', 'Status': 'DISCOVERY_FAILED', 'Records': None, 'Error': str(exc)})
+                log.error('%s discovery failed: %s', state, exc)
+                continue
+
+            for district in districts:
+                log.info('Fetching %s / %s', state, district)
+                try:
+                    # Re-select state if portal resets it on district change.
+                    state_control = dropdown(page, 'state', STATE_SELECTOR)
+                    choose(page, state_control, state)
+                    page.wait_for_timeout(400)
+                    district_control = dropdown(page, 'district', DISTRICT_SELECTOR)
+                    before = len(responses)
+                    choose(page, district_control, district)
+                    # Some sites require clicking a Search button.
+                    for button_name in ('Search', 'Submit', 'View Vendors', 'Get Vendors'):
+                        button = page.get_by_role('button', name=button_name, exact=True)
+                        if button.count() and button.first.is_visible():
+                            button.first.click()
+                            break
+                    deadline = time.monotonic() + RESPONSE_WAIT_SECONDS
+                    while len(responses) == before and time.monotonic() < deadline:
+                        page.wait_for_timeout(300)
+                    if len(responses) == before:
+                        raise TimeoutError('No matching API response observed after district selection')
+                    response = responses[-1]
+                    if response['status'] != 200:
+                        raise RuntimeError(f'HTTP {response["status"]}')
+                    vendors = unwrap_vendor_records(response['payload'])
+                    if not vendors:
+                        raise RuntimeError('No vendor records recognized in response; inspect envelope or portal state')
+                    for v in vendors:
+                        rows.append({
+                            'State': state, 'District': district,
+                            'Vendor ID': v.get('vendorId'),
+                            'Vendor Name': v.get('vendorName'),
+                            'District Installations': count_field(v, 'districtwiseInstallationAndCapacity'),
+                            'State Installations': count_field(v, 'statewiseInstallationAndCapacity'),
+                            'National Installations': count_field(v, 'nationwiseInstallationAndCapacity'),
+                            'Captured At': datetime.now().isoformat(timespec='seconds'),
+                        })
+                    audits.append({'State': state, 'District': district, 'Status': 'CAPTURED_UNVERIFIED', 'Records': len(vendors), 'Error': ''})
+                except Exception as exc:
+                    audits.append({'State': state, 'District': district, 'Status': 'FAILED', 'Records': None, 'Error': str(exc)})
+                    log.error('%s / %s failed: %s', state, district, exc)
+                finally:
+                    # Checkpoint so a failed run does not lose successful responses.
+                    pd.DataFrame(rows).to_csv(OUTPUT / 'vendors_checkpoint.csv', index=False)
+                    pd.DataFrame(audits).to_csv(OUTPUT / 'extraction_audit.csv', index=False)
+
+        context.close()
+
+    df = pd.DataFrame(rows)
+    audit = pd.DataFrame(audits)
+    if not df.empty:
+        df = df.drop_duplicates(subset=['State', 'District', 'Vendor ID'], keep='last')
+    with pd.ExcelWriter(OUTPUT / 'AP_Telangana_Vendors.xlsx', engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Vendor Master', index=False)
+        audit.to_excel(writer, sheet_name='Extraction Audit', index=False)
+    print(f'\nSaved {len(df)} district-vendor records. Check Extraction Audit: CAPTURED_UNVERIFIED is NOT portal-validated.')
+    print('If controls failed, inspect output/controls.txt and output/portal_screenshot.png.')
 
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Build an in-memory Excel download, without writing a CSV to GitHub."""
-    output = BytesIO()
-    date_label = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y")
-    export = df.rename(columns={"Installations": f"Installations ({date_label})"})
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export.to_excel(writer, index=False, sheet_name="Vendor Comparison")
-        sheet = writer.sheets["Vendor Comparison"]
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for col in sheet.columns:
-            letter = col[0].column_letter
-            sheet.column_dimensions[letter].width = min(
-                max(14, max(len(str(cell.value or "")) for cell in col) + 2), 45
-            )
-    return output.getvalue()
-
-
-if __name__ == "__main__":
-    # This is a real API smoke test; it will clearly fail until the
-    # encrypted request builder and credentials are configured.
-    try:
-        result = extract_district("Andhra Pradesh", "Eluru", VendorAPIClient())
-        print(result.head().to_string(index=False))
-    except VendorAPIError as exc:
-        print(f"Live extraction not configured: {exc}")
+if __name__ == '__main__':
+    main()
